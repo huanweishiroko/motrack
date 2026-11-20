@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>姿态测试页面</title>
+</head>
+<body>
+    <h1>姿态识别测试</h1>
+
+
+    <input type="file" id="imgInput" accept="image/*">
+
+    <div>
+        <h3>原图预览</h3>
+        <img id="previewImg" style="max-width: 400px;">
+    </div>
+
+    <div>
+        <h3>后端返回结果</h3>
+        <pre id="resultBox" style="background: #f4f4f4;padding: 10px;border-radius: 5px;"></pre>
+    </div>
+
+    <script>
+        const imgInput = document.getElementById('imgInput');
+        const previewImg = document.getElementById('previewImg');
+        const resultBox = document.getElementById('resultBox');
+
+        imgInput.addEventListener('change', function(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            console.log("1. 成功获取到文件:", file.name);
+
+            const reader = new FileReader();
+            
+            reader.onload = function(e) {
+                const base64String = e.target.result;
+                console.log("2. 成功转成 Base64，前100个字符:", base64String.substring(0, 100));
+                
+                previewImg.src = base64String;
+                resultBox.innerText = "正在发送给后端处理...";
+                
+                fetch('http://127.0.0.1:8000/api/Poseinput', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ img_64: base64String })
+                })
+                .then(response => {
+                    console.log("3. 收到后端响应状态码:", response.status);
+                    return response.json();
+                })
+                .then(data => {
+                    console.log("4. 解析后的后端数据:", data);
+                    resultBox.innerText = JSON.stringify(data, null, 4);
+                })
+                .catch(error => {
+                    console.error("请求报错了:", error);
+                    resultBox.innerText = "请求失败：" + error;
+                });
+            };
+            
+            reader.readAsDataURL(file);
+        });
+    </script>
+
+</body>
+</html>
