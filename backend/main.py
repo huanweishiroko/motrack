@@ -14,13 +14,13 @@ app.add_middleware(
 )
 
 
-class Poseinput(BaseModel):
+class Gestureinput(BaseModel):
     img_64:str
 
-class Poseoutput(BaseModel):
+class Gestureoutput(BaseModel):
     status:str #success or error
     is_success:bool 
-    action_name:str
+    gesture_name:str
     confidence:float #置信度
     feedback:str #反馈，动作微调
     state:str
@@ -36,15 +36,15 @@ def decode_base64_image(img_str):
     print(frame.shape)
     return frame
 
-@app.post("/api/Poseinput")
-def detect_pose(data:Poseinput):
+@app.post("/api/Gestureinput")
+def detect_gesture(data:Gestureinput):
     frame=decode_base64_image(data.img_64)
     #mediapipe推理
 
-    return Poseoutput(
+    return Gestureoutput(
         status="success",
         is_success=True,
-        action_name="双手平举",
+        gesture_name="双手平举",
         confidence=0.95,
         feedback="动作标准",
         state="ready",
