@@ -56,3 +56,9 @@ output/
 *.png
 *.jpeg
 规划.txt
+
+
+*.task
+
+# Local smoke script (not committed)
+test_hands_tasks.py
