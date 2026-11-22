@@ -41,7 +41,7 @@
                 previewImg.src = base64String;
                 resultBox.innerText = "正在发送给后端处理...";
                 
-                fetch('http://127.0.0.1:8000/api/Poseinput', {
+                fetch('http://127.0.0.1:8000/api/Gestureinput', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
