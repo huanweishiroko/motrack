@@ -5,9 +5,15 @@ import base64
 import numpy
 import cv2
 import os
-import math
 import urllib.request
+import joblib
 from fastapi.middleware.cors import CORSMiddleware
+import sys
+from collections import deque, Counter
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "gesture"))
+
+from gesture_features import extract
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -23,8 +29,6 @@ MODEL_URL = (
     "hand_landmarker/float16/1/hand_landmarker.task"
 )
 DEFAULT_MODEL = "hand_landmarker.task"
-INDEX_FINGER_TIP = 8
-
 HAND_KEYS=[
     "wrist",
     "thumb_cmc",
@@ -50,15 +54,10 @@ HAND_KEYS=[
 ]
 LOW_CONF=0.5
 
-FINGERS = [
-    ("index_finger_mcp",  "index_finger_pip",  "index_finger_tip"),
-    ("middle_finger_mcp", "middle_finger_pip", "middle_finger_tip"),
-    ("ring_finger_mcp",   "ring_finger_pip",   "ring_finger_tip"),
-    ("pinky_mcp",         "pinky_pip",         "pinky_tip"),
-]
-FINGER_ANGLE_THRESHOLD = 165.0
-THUMB_ANGLE_THRESHOLD = 155.0
-MIN_HAND_SIZE_RATIO = 0.18   # 手腕↔中指MCP / 画面短边
+CONF_MIN = 0.60   # 最高概率低于它就判为不认识
+MARGIN_MIN = 0.15 # top1 与 top2 差距太小也算不认识
+VOTE_FRAMES = 5   # 时序投票窗口
+VOTE_MIN = 3      # 窗口内至少几票才认
 
 class Gestureinput(BaseModel):
     img_64:str
@@ -105,68 +104,60 @@ def make_detector(model_path: str, num_hands: int, video_mode: bool):
 
 
 
-detector=make_detector(ensure_model(DEFAULT_MODEL), num_hands=2, video_mode=False)
+_detector = None
 
+def get_detector():
+    global _detector
+    if _detector is None:
+        _detector = make_detector(ensure_model(DEFAULT_MODEL), num_hands=2, video_mode=False)
+    return _detector
+
+CLF_PATH = os.path.join(_HERE, "..", "gesture", "data", "gesture_clf.joblib")
+_B = joblib.load(CLF_PATH)
+clf = _B["model"]
+CLF_CLASSES = _B["classes"]
+CLF_ALIGN = _B["align"]
+MIN_HAND_PX = _B["min_hand_px"]
+print(f"[clf] {len(CLF_CLASSES)} 类 {CLF_CLASSES}, align={CLF_ALIGN}, "
+      f"min_hand_px={MIN_HAND_PX:g}, test_acc={_B['test_acc']}")
 def to_mp_image(rgb: numpy.ndarray) -> mediapipe.Image:
     return mediapipe.Image(
         image_format=mediapipe.ImageFormat.SRGB,
         data=numpy.ascontiguousarray(rgb),
     )
 
-def dist(a, b, width: int, height: int) -> float:
-    ax, ay = a.x * width, a.y * height
-    bx, by = b.x * width, b.y * height
-    return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
+def classify_hand(landmarks, width, height):
+    """返回 (label, proba) 或 None（手太小 / 退化帧）。"""
+    pts = numpy.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=numpy.float32)
+    feat = extract(pts, width, height, align=CLF_ALIGN, min_hand_px=MIN_HAND_PX)
+    if feat is None:
+        return None
+    proba = clf.predict_proba(feat.reshape(1, -1))[0]
+    order = numpy.argsort(proba)[::-1]
+    top1, top2 = float(proba[order[0]]), float(proba[order[1]])
+    if top1 < CONF_MIN or (top1 - top2) < MARGIN_MIN:
+        return ("?", top1)          # 分布外/拿不准，不硬选
+    return CLF_CLASSES[order[0]], top1
 
-def point_abs(pt,w,h):
-    return (pt.x*w,pt.y*h) #未处理z
 
-def angle_between(p_mcp, p_pip, p_tip, width: int, height: int) -> float:
+_hist = {}
+_last = {}
 
-    mcp = point_abs(p_mcp, width, height)
-    pip = point_abs(p_pip, width, height)
-    tip = point_abs(p_tip, width, height)
-
-    v1 = (mcp[0] - pip[0], mcp[1] - pip[1])
-    v2 = (tip[0] - pip[0], tip[1] - pip[1])
-    dot = v1[0] * v2[0] + v1[1] * v2[1]
-    len1 = math.hypot(v1[0], v1[1])
-    len2 = math.hypot(v2[0], v2[1])
-
-    if len1 < 1e-6 or len2 < 1e-6:
-        return 0.0
-    cos_ang = max(min(dot / (len1 * len2), 1.0), -1.0)
-    rad = math.acos(cos_ang)
-    return math.degrees(rad)
-
-def count_extended_fingers(landmarks, width: int, height: int) -> int:
-    by_name = dict(zip(HAND_KEYS, landmarks))
-    count = 0
-
-    for mcp_key, pip_key, tip_key in FINGERS:
-        mcp = by_name[mcp_key]
-        pip = by_name[pip_key]
-        tip = by_name[tip_key]
-        ang = angle_between(mcp, pip, tip, width, height)
-        print(f"[finger] {mcp_key:<18} angle={ang:.1f}")
-        if ang >= FINGER_ANGLE_THRESHOLD:
-            count += 1
-
-    th_mcp = by_name["thumb_mcp"]
-    th_ip = by_name["thumb_ip"]
-    th_tip = by_name["thumb_tip"]
-    th_ang = angle_between(th_mcp, th_ip, th_tip, width, height)
-    print(f"[finger] {'thumb_mcp':<18} angle={th_ang:.1f}")
-    if th_ang >= THUMB_ANGLE_THRESHOLD:
-        count += 1
-
-    return count
-
-def hand_size_ratio(landmarks, width: int, height: int) -> float:
-    by_name = dict(zip(HAND_KEYS, landmarks))
-    wrist = by_name["wrist"]
-    middle_mcp = by_name["middle_finger_mcp"]
-    return dist(wrist, middle_mcp, width, height) / min(width, height)
+def _vote(side, res):
+    """同一只手 5 帧内至少 3 票才认；够票就输出多数票，不够返回不确定。"""
+    if res is None:
+        _hist.pop(side, None)
+        _last.pop(side, None)
+        return None
+    d = _hist.setdefault(side, deque(maxlen=VOTE_FRAMES))
+    d.append(res[0])
+    _last.setdefault(side, {})[res[0]] = res[1]
+    if len(d) < VOTE_MIN:
+        return res
+    label, n = Counter(d).most_common(1)[0]
+    if n < VOTE_MIN:
+        return ("?", res[1])
+    return (label, _last[side].get(label, res[1]))
 
 @app.post("/api/Gestureinput")
 def detect_gesture(data:Gestureinput):
@@ -182,7 +173,7 @@ def detect_gesture(data:Gestureinput):
             keypoints=None
         )
     height, width = frame.shape[:2]
-    result=detector.detect(to_mp_image(frame))
+    result=get_detector().detect(to_mp_image(frame))
     hands=result.hand_landmarks
     labels=result.handedness
     
@@ -208,29 +199,33 @@ def detect_gesture(data:Gestureinput):
         for idx, name in enumerate(HAND_KEYS):
             lm = landmarks[idx]
             keypoints[f"{side}_{name}"] = [lm.x, lm.y, lm.z]
-        size = hand_size_ratio(landmarks, width, height)
-        print(f"[size] {size:.3f}")
-        if size < MIN_HAND_SIZE_RATIO:
-            counts.append(None)
-        else:
-            counts.append(count_extended_fingers(landmarks, width, height))
+        counts.append(_vote(side, classify_hand(landmarks, width, height)))
     avg = sum(scores) / len(scores) if scores else 0.0
     low = avg < LOW_CONF
-    side_cn = "双手" if len(hands) > 1 else ("左手" if labels[0][0].category_name == "Left" else "右手")
-    finger_cn = " + ".join("?" if c is None else str(c) for c in counts)
-    gated = any(c is None for c in counts)
-    bad = gated or low
+    side_cn = "双手" if len(hands) > 1 else ("左手" if getattr(labels[0][0], "category_name", "") == "Left" else "右手")
+    picked = [c for c in counts if c is not None]
+    gated = len(picked) < len(counts)
+    unknown = any(c[0] == "?" for c in picked)
+    bad = gated or low or unknown
 
     if gated:
         gesture_name = f"{side_cn} 距离过远，未判定"
         feedback = "手离镜头太远，请靠近一点"
+        conf = 0.0
+    elif unknown:
+        gesture_name = f"{side_cn}：姿势不在训练集内"
+        feedback = "这个手势没训练过，认不准是正常的"
+        conf = min(c[1] for c in picked)
     else:
-        gesture_name = f"{side_cn} 伸出 {finger_cn} 指"
-        feedback = "识别置信度偏低，调整光照和距离" if low else "手部关键点已获取"
+        names = " + ".join(c[0] for c in picked)
+        conf = min(c[1] for c in picked)
+        gesture_name = f"{side_cn}：{names}"
+        feedback = "识别置信度偏低，调整姿势" if conf < 0.6 else "识别成功"
 
+    bad = bad or conf < 0.6
     return Gestureoutput(status="success", is_success=not bad,
                          gesture_name=gesture_name,
-                         confidence=round(avg, 2),
+                         confidence=round(conf, 2),
                          feedback=feedback,
                          state="low_confidence" if bad else "ready",
                          keypoints=keypoints)
