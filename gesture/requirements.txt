@@ -1,0 +1,8 @@
+# 实测可用的版本组合（2026-11）：
+#   mediapipe 0.10.35 + cv2 5.1.0 + numpy 2.5.5 + sklearn 1.9.1
+#   mediapipe 1.2.3 也能跑（1.x 已删掉 mp.solutions，collect.py 会自动走 tasks API）
+mediapipe>=0.10.14
+opencv-python>=4.8
+numpy>=1.24
+Pillow>=10.0
+scikit-learn>=1.3
