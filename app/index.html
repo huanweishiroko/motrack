@@ -4,68 +4,227 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>手势识别页面</title>
+    <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; max-width: 960px; margin-inline: auto;
+            font-family: system-ui, "Microsoft YaHei", sans-serif;
+            background: #111; color: #e6e6e6; }
+
+    .stage { position: relative; background: #000; border-radius: 10px; overflow: hidden; }
+    #cam, #overlay { display: block; width: 100%; }
+    #overlay { position: absolute; inset: 0; }
+
+    .bar { display: flex; gap: 10px; margin: 16px 0; flex-wrap: wrap; align-items: center; }
+        
+    
+    button { padding: 8px 18px; border: 0; border-radius: 6px;
+            background: #2d7ff9; color: #fff; cursor: pointer; font-size: 14px; }
+    button:disabled { background: #3a3a3a; color: #888; cursor: not-allowed; }
+
+    .panel { display: grid; gap: 8px; padding: 14px 16px;
+            background: #1b1b1b; border-radius: 8px; margin-bottom: 16px; }
+    .panel .row { display: flex; gap: 12px; }
+    .panel .k { width: 48px; color: #888; }
+    .bad { color: #ff8a65; }
+
+    #raw { background: #1b1b1b; padding: 12px; border-radius: 8px;
+            max-height: 220px; overflow: auto; font-size: 12px; line-height: 1.5; }
+    </style>
 </head>
 <body>
     <h1>手势识别测试</h1>
 
 
+
+    <div class="stage">
+    <video id="cam" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    </div>
+
+    <div class="bar">
+    <button id="btnStart">开启摄像头</button>
+    <button id="btnStop" disabled>停止</button>
+    <select id="devSel" style="padding:8px;border-radius:6px;background:#1b1b1b;color:#e6e6e6;border:1px solid #333"></select>
+    </div>
+
+    <div class="panel">
+    <div class="row"><span class="k">状态</span><b id="state">—</b></div>
+    <div class="row"><span class="k">结果</span><b id="gesture">—</b></div>
+    <div class="row"><span class="k">反馈</span><b id="feedback">—</b></div>
+    </div>
+
+    <pre id="raw"></pre>
     <input type="file" id="imgInput" accept="image/*">
-
-    <div>
-        <h3>原图预览</h3>
-        <img id="previewImg" style="max-width: 400px;">
-        <canvas id="myCanvas" style="position: absolute; top: 0; left: 0; max-width: 400px;"></canvas>
-    </div>
-
-    <div>
-        <h3>后端返回结果</h3>
-        <pre id="resultBox" style="background: #f4f4f4;padding: 10px;border-radius: 5px;"></pre>
-    </div>
-
     <script>
+        const API = 'http://127.0.0.1:8000/api/Gestureinput';
+        const INTERVAL_MS = 200;
+
+        const cam = document.getElementById('cam');
+        const overlay = document.getElementById('overlay');
+        const btnStart = document.getElementById('btnStart');
+        const btnStop = document.getElementById('btnStop');
+        const devSel = document.getElementById('devSel');
         const imgInput = document.getElementById('imgInput');
-        const previewImg = document.getElementById('previewImg');
-        const resultBox = document.getElementById('resultBox');
+        const EDGES = [
+        [0,1],[1,2],[2,3],[3,4],           // 拇指
+        [0,5],[5,6],[6,7],[7,8],           // 食指
+        [5,9],[9,10],[10,11],[11,12],      // 中指
+        [9,13],[13,14],[14,15],[15,16],    // 无名指
+        [13,17],[17,18],[18,19],[19,20],   // 小指
+        [0,17]                              // 掌根横线
+        ];
+        const KEYS = [
+        'wrist',
+        'thumb_cmc','thumb_mcp','thumb_ip','thumb_tip',
+        'index_finger_mcp','index_finger_pip','index_finger_dip','index_finger_tip',
+        'middle_finger_mcp','middle_finger_pip','middle_finger_dip','middle_finger_tip',
+        'ring_finger_mcp','ring_finger_pip','ring_finger_dip','ring_finger_tip',
+        'pinky_mcp','pinky_pip','pinky_dip','pinky_tip'
+        ];
 
-        imgInput.addEventListener('change', function(event) {
-            const file = event.target.files[0];
-            if (!file) return;
+        let stream = null;
+        let timer = null;
+        let busy = false;
 
-            console.log("1. 成功获取到文件:", file.name);
+        async function listCameras() {
+        const tmp = await navigator.mediaDevices.getUserMedia({ video: true });
+        tmp.getTracks().forEach(t => t.stop());
 
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter(d => d.kind === 'videoinput');
+
+        devSel.innerHTML = cams
+            .map((d, i) => `<option value="${d.deviceId}">${d.label || '摄像头 ' + (i + 1)}</option>`)
+            .join('');
+        }
+
+        cam.addEventListener('loadedmetadata', () => {
+        overlay.width = cam.videoWidth;
+        overlay.height = cam.videoHeight;
+        });
+
+        btnStart.addEventListener('click', async () => {
+        try {
+            if (!devSel.options.length) await listCameras();
+
+            stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                deviceId: devSel.value ? { exact: devSel.value } : undefined,
+                width: 640,
+                height: 480
+            }
+            });
+
+            cam.srcObject = stream;
+            btnStart.disabled = true;
+            btnStop.disabled = false;
+            timer = setInterval(tick, INTERVAL_MS);
+        } catch (err) {
+            console.error('摄像头打开失败', err);
+        }
+        });
+
+        btnStop.addEventListener('click', () => {
+        clearInterval(timer);
+        timer = null;
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        stream = null;
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+        });
+
+        function tick() {
+        if (!cam.videoWidth) return;
+        sendFrame(captureFrame());
+        }
+
+        function captureFrame() {
+        const c = document.createElement('canvas');
+        c.width = cam.videoWidth;
+        c.height = cam.videoHeight;
+        c.getContext('2d').drawImage(cam, 0, 0);
+        return c.toDataURL('image/jpeg', 0.7);
+        }
+
+        async function sendFrame(dataUrl) {
+        if (busy) return;
+        busy = true;
+        try {
+            const res = await fetch(API, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ img_64: dataUrl })
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            render(await res.json());
+        } catch (err) {
+            console.error('请求失败', err);
+        } finally {
+            busy = false;
+        }
+        }
+
+        imgInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const dataUrl = await new Promise((resolve, reject) => {
             const reader = new FileReader();
-            
-            reader.onload = function(e) {
-                const base64String = e.target.result;
-                console.log("2. 成功转成 Base64，前100个字符:", base64String.substring(0, 100));
-                
-                previewImg.src = base64String;
-                resultBox.innerText = "正在发送给后端处理...";
-                
-                fetch('http://127.0.0.1:8000/api/Gestureinput', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ img_64: base64String })
-                })
-                .then(response => {
-                    console.log("3. 收到后端响应状态码:", response.status);
-                    return response.json();
-                })
-                .then(data => {
-                    console.log("4. 解析后的后端数据:", data);
-                    resultBox.innerText = JSON.stringify(data, null, 4);
-                })
-                .catch(error => {
-                    console.error("请求报错了:", error);
-                    resultBox.innerText = "请求失败：" + error;
-                });
-            };
-            
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = reject;
             reader.readAsDataURL(file);
         });
-    </script>
 
+        await sendFrame(dataUrl);
+        });
+
+        function render(data) {
+        document.getElementById('state').textContent = data.state;
+        document.getElementById('gesture').textContent = data.gesture_name;
+        document.getElementById('feedback').textContent = data.feedback;
+        document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
+        drawSkeleton(data.keypoints);
+        }
+
+        function drawSkeleton(keypoints) {
+        const ctx = overlay.getContext('2d');
+        const w = overlay.width, h = overlay.height;
+        ctx.clearRect(0, 0, w, h);
+        if (!keypoints) return;
+        const sides = [...new Set(Object.keys(keypoints).map(k => k.split('_')[0]))];
+
+        for (const side of sides) {
+            const pts = KEYS.map(k => keypoints[`${side}_${k}`]);
+            if (pts.some(p => !p)) continue;
+
+            const color = side === 'left' ? '#40e0d0' : '#ff9848';
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            for (const [a, b] of EDGES) {
+            ctx.moveTo(pts[a][0] * w, pts[a][1] * h);
+            ctx.lineTo(pts[b][0] * w, pts[b][1] * h);
+            }
+            ctx.stroke();
+
+            ctx.fillStyle = color;
+            for (const p of pts) {
+            ctx.beginPath();
+            ctx.arc(p[0] * w, p[1] * h, 2.5, 0, Math.PI * 2);
+            ctx.fill();
+            }
+        }
+        }
+
+        for (const [name, pos] of Object.entries(keypoints)) {
+            const [nx, ny] = pos;
+            ctx.beginPath();
+            ctx.arc(nx * overlay.width, ny * overlay.height, 3, 0, Math.PI * 2);
+            ctx.fillStyle = name.startsWith('left_') ? '#40e0d0' : '#ff9848';
+            ctx.fill();
+        }
+        
+    </script>
 </body>
 </html>
