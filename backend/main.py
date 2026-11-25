@@ -118,25 +118,29 @@ clf = _B["model"]
 CLF_CLASSES = _B["classes"]
 CLF_ALIGN = _B["align"]
 MIN_HAND_PX = _B["min_hand_px"]
+TRAIN_SIDE = _B.get("train_side", "left")   # 训练集是哪只手；另一只手推理时镜像
+MIN_SIDE_CONF = 0.80                        # 左右手判定低于此值 → 不翻、不判
+OTHER_LABEL = "其他"                         # 四不像统一兜到这一类，不强行判真手势
 print(f"[clf] {len(CLF_CLASSES)} 类 {CLF_CLASSES}, align={CLF_ALIGN}, "
-      f"min_hand_px={MIN_HAND_PX:g}, test_acc={_B['test_acc']}")
+      f"min_hand_px={MIN_HAND_PX:g}, train_side={TRAIN_SIDE}, test_acc={_B['test_acc']}")
 def to_mp_image(rgb: numpy.ndarray) -> mediapipe.Image:
     return mediapipe.Image(
         image_format=mediapipe.ImageFormat.SRGB,
         data=numpy.ascontiguousarray(rgb),
     )
 
-def classify_hand(landmarks, width, height):
+def classify_hand(landmarks, width, height, mirror=False):
     """返回 (label, proba) 或 None（手太小 / 退化帧）。"""
     pts = numpy.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=numpy.float32)
-    feat = extract(pts, width, height, align=CLF_ALIGN, min_hand_px=MIN_HAND_PX)
+    feat = extract(pts, width, height, align=CLF_ALIGN, min_hand_px=MIN_HAND_PX,
+                   mirror=mirror)
     if feat is None:
         return None
     proba = clf.predict_proba(feat.reshape(1, -1))[0]
     order = numpy.argsort(proba)[::-1]
     top1, top2 = float(proba[order[0]]), float(proba[order[1]])
     if top1 < CONF_MIN or (top1 - top2) < MARGIN_MIN:
-        return ("?", top1)          # 分布外/拿不准，不硬选
+        return (OTHER_LABEL, top1)   # 四不像：兜进「其他」，不强行选真手势 
     return CLF_CLASSES[order[0]], top1
 
 
@@ -199,13 +203,16 @@ def detect_gesture(data:Gestureinput):
         for idx, name in enumerate(HAND_KEYS):
             lm = landmarks[idx]
             keypoints[f"{side}_{name}"] = [lm.x, lm.y, lm.z]
-        counts.append(_vote(side, classify_hand(landmarks, width, height)))
+        # 左右手判不准就不翻：模型对镜像不敏感，翻错方向也无所谓，别丢帧
+        counts.append(_vote(side, classify_hand(
+            landmarks, width, height,
+            side != TRAIN_SIDE if score >= MIN_SIDE_CONF else False)))
     avg = sum(scores) / len(scores) if scores else 0.0
     low = avg < LOW_CONF
     side_cn = "双手" if len(hands) > 1 else ("左手" if getattr(labels[0][0], "category_name", "") == "Left" else "右手")
     picked = [c for c in counts if c is not None]
     gated = len(picked) < len(counts)
-    unknown = any(c[0] == "?" for c in picked)
+    unknown = any(c[0] in ("?", OTHER_LABEL) for c in picked)
     bad = gated or low or unknown
 
     if gated:
@@ -213,8 +220,8 @@ def detect_gesture(data:Gestureinput):
         feedback = "手离镜头太远，请靠近一点"
         conf = 0.0
     elif unknown:
-        gesture_name = f"{side_cn}：姿势不在训练集内"
-        feedback = "这个手势没训练过，认不准是正常的"
+        gesture_name = f"{side_cn}：{OTHER_LABEL}"
+        feedback = "未识别的姿势，按「其他」处理"
         conf = min(c[1] for c in picked)
     else:
         names = " + ".join(c[0] for c in picked)
