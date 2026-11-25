@@ -30,6 +30,8 @@ OUT_DIR = os.path.join(HERE, "out")
 
 REQUIRED = ("model", "classes", "align", "min_hand_px", "feature_version", "dim")
 
+MIN_SIDE_CONF = 0.80   # 左右手判定低于此值就跳过，因为镜像方向错了必错
+
 
 def load_bundle(path):
     import joblib
@@ -44,15 +46,17 @@ def load_bundle(path):
         sys.exit(f"模型包是 v{bundle['feature_version']}，当前 gesture_features.py 只出 v2")
     print(f"[model] {len(bundle['classes'])} 类 {bundle['classes']}")
     print(f"[model] align={bundle['align']}  min_hand_px={bundle['min_hand_px']:g}  "
+          f"train_side={bundle.get('train_side', 'left')}  "
           f"test_acc={bundle.get('test_acc', '?')}")
     return bundle
 
 
-def make_feature(bundle, pts, width, height):
+def make_feature(bundle, pts, width, height, mirror=False):
     from gesture_features import extract
 
     feat = extract(pts, width=width, height=height,
-                   align=bundle["align"], min_hand_px=bundle["min_hand_px"])
+                   align=bundle["align"], min_hand_px=bundle["min_hand_px"],
+                   mirror=mirror)
     if feat is None:
         return None
     if feat.size != bundle["dim"]:
@@ -91,6 +95,9 @@ def run_camera(bundle, cam, width, height, flip=True):
     import cv2
 
     from collect import HandTracker, draw_hand  # 复用采集端的检测/绘制
+    from gesture_features import decide_mirror
+
+    train_side = bundle.get("train_side", "left")
 
     cap = cv2.VideoCapture(cam, cv2.CAP_DSHOW if os.name == "nt" else 0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -109,21 +116,32 @@ def run_camera(bundle, cam, width, height, flip=True):
             if flip:
                 frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
-            pts = tracker.detect(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            pts, side, side_score = tracker.detect_with_side(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             if pts is None:
                 cv2.putText(frame, "NO HAND", (16, 40), cv2.FONT_HERSHEY_SIMPLEX,
                             0.9, (60, 60, 255), 2, cv2.LINE_AA)
             else:
                 draw_hand(frame, pts, w, h)
-                feat = make_feature(bundle, pts, w, h)
-                if feat is None:
+                mirror, side_ok = decide_mirror(side, side_score, train_side, MIN_SIDE_CONF)
+                if not side_ok:
+                    # 左右手判不准时不做判定：猜错方向比认不出更糟
+                    cv2.putText(frame, f"side ? ({side_score:.2f})", (16, 44),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 140, 255), 2, cv2.LINE_AA)
+                    feat = None
+                else:
+                    feat = make_feature(bundle, pts, w, h, mirror=mirror)
+                if not side_ok:
+                    pass
+                elif feat is None:
                     cv2.putText(frame, "too small / too far", (16, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 140, 255), 2, cv2.LINE_AA)
                 else:
                     label, p, alt, pa = predict(bundle, feat)
                     cv2.putText(frame, f"{label}  {p:.0%}", (16, 44),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (80, 230, 80), 2, cv2.LINE_AA)
-                    cv2.putText(frame, f"2nd: {alt} {pa:.0%}", (16, 78),
+                    cv2.putText(frame, f"2nd: {alt} {pa:.0%}   side: {side}"
+                                       f"{'  mirrored' if mirror else ''}",
+                                (16, 78),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
             cv2.imshow(win, frame)
             if cv2.waitKey(1) & 0xFF in (27, ord("q")):

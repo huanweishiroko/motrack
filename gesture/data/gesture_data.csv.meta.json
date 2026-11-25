@@ -1,6 +1,7 @@
 {
   "feature_version": 2,
-  "width": 640,
-  "height": 480,
-  "rows": 1000
+  "width": 960,
+  "height": 540,
+  "rows_at_start": 4791,
+  "created_at": "2026-11-25T17:25:56"
 }

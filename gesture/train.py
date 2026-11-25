@@ -76,6 +76,18 @@ def align_rows(X):
     return out.reshape(X.shape)
 
 
+def mirror_features(X):
+    """左右翻转 42 维特征：x 分量取反。
+
+    对单指/握拳这类静态手势来说，镜像不改变语义（食指镜像后还是食指），
+    所以它可以当训练增广用——用来覆盖「手背朝镜头」这种样本。
+    注意：只能对训练集做，测试集翻转等于把答案换了。
+    """
+    Y = X.copy()
+    Y[:, 0::2] *= -1
+    return Y
+
+
 def time_split(X, y, classes, train_ratio=0.6, gap_ratio=0.1):
     """每类按行号（= 采集时间）切：前 60% 训练，中间 10% 丢掉，后 30% 测试。
 
@@ -124,6 +136,11 @@ def main():
                     help="关掉旋转归一化（不建议；只在做对照实验时用）")
     ap.add_argument("--min-hand-px", type=float, default=80.0,
                     help="写进模型包的掌长门控，推理端照此执行；要和采集时一致")
+    ap.add_argument("--train-side", choices=["left", "right"], default="left",
+                    help="训练集用的是哪只手（MediaPipe 报的名字）；写进模型包，"
+                         "推理端据此决定另一只手要不要镜像")
+    ap.add_argument("--mirror-aug", action="store_true",
+                    help="训练集做镜像增广（x 取反），覆盖手背朝镜头的样本；测试集不动")
     args = ap.parse_args()
 
     X, y, header = load(args.input)
@@ -175,16 +192,27 @@ def main():
         n_te = int(((ys[te] == c)).sum())
         say(f"    {c:<8} train {n_tr:>3} / test {n_te:>3}")
 
+    # 镜像增广：只作用于训练集（测试集翻转等于把答案换了）
+    Xtr, ytr = Xs[tr], ys[tr]
+    if args.mirror_aug:
+        Xtr = np.vstack([Xtr, mirror_features(Xtr)])
+        ytr = np.concatenate([ytr, ytr])
+        say(f"    镜像增广: 训练 {len(tr)} → {len(ytr)} 条（测试集不变）")
+
     # ---- 训练 ----
     say("")
     say("第 6 步 · 训练与评估")
     res = {}
     say("  [C] 过滤 + 抽稀 k=%d（主结果）" % args.k)
-    res["slim"] = evaluate("slim", Xs[tr], ys[tr], Xs[te], ys[te], classes)
+    res["slim"] = evaluate("slim", Xtr, ytr, Xs[te], ys[te], classes)
 
     say("  [B] 只过滤，不抽稀")
     tr_all, te_all = time_split(Xf, yf, classes)
-    res["full"] = evaluate("full", Xf[tr_all], yf[tr_all], Xf[te_all], yf[te_all], classes)
+    Xtr_all, ytr_all = Xf[tr_all], yf[tr_all]
+    if args.mirror_aug:
+        Xtr_all = np.vstack([Xtr_all, mirror_features(Xtr_all)])
+        ytr_all = np.concatenate([ytr_all, ytr_all])
+    res["full"] = evaluate("full", Xtr_all, ytr_all, Xf[te_all], yf[te_all], classes)
 
     rng = np.random.default_rng(0)
     ytr_shuf = ys[tr].copy()
@@ -240,6 +268,8 @@ def main():
         "classes": [str(c) for c in clf.classes_],
         "align": bool(args.align),          # 推理必须照做
         "min_hand_px": float(args.min_hand_px),
+        "train_side": args.train_side,      # 训练数据是哪只手；另一只手推理时要镜像
+        "mirror_aug": bool(args.mirror_aug),
         "feature_version": 2,
         "dim": int(Xs.shape[1]),
         "use_z": Xs.shape[1] == 63,

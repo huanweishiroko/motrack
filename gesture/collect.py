@@ -73,16 +73,19 @@ CJK_FONTS = [
 HINT = ("0-9/a d f g 选类   空格 暂停   s 单帧   u 撤销   q 退出",
         "0-9/a d f g class  SPACE pause  s shot  u undo  q quit")
 
-# 类别键位：前 10 类用数字，11 类起用 a/d/f/g（避开 s/u/q 这些功能键）
-CLASS_KEYS = "0123456789adfg"
+# 类别键位：前 10 类用数字，11 类起用 a/d/f/g/h（避开 s/u/q 这些功能键）
+CLASS_KEYS = "0123456789adfgh"
 
 # 内置类表（中文名直接写进 CSV，训练和推理都按这个名字走）
 PRESETS = {
     "single": ["食指", "中指", "无名指", "小指"],
     "combo": ["点赞", "OK", "张开", "比耶", "握拳", "六",
-              "点踩", "后三指", "中三指", "比心"],
+              "点踩", "中三指", "比心"],
+    # 「其他」是分类器的出口：不属于任何目标手势的姿势全丢这里，
+    # 没有这一类，模型对任何输入都必须硬选一个目标类。
+    "other": ["其他"],
 }
-PRESETS["all"] = PRESETS["single"] + PRESETS["combo"]
+PRESETS["all"] = PRESETS["single"] + PRESETS["combo"] + PRESETS["other"]
 
 
 def ensure_model() -> str:
@@ -128,20 +131,41 @@ class HandTracker:
             self._hands = vision.HandLandmarker.create_from_options(opts)
 
     def detect(self, rgb):
+        pts, _, _ = self.detect_with_side(rgb)
+        return pts
+
+    def detect_with_side(self, rgb):
+        """返回 (21,3 数组, 左右手标签, 置信度)；没检测到手时 (None, None, 0.0)。
+
+        标签是 MediaPipe 的 original 结果（它假设输入是镜像自拍画面，
+        所以标签可能和真人左右相反），这里只用来比「两只手是不是同一只」。
+        """
         if self.kind == "solutions":
             res = self._hands.process(rgb)
             if not res.multi_hand_landmarks:
-                return None
+                return None, None, 0.0
             lms = res.multi_hand_landmarks[0].landmark
+            side, score = None, 0.0
+            try:
+                c = res.multi_handedness[0].classification[0]
+                side, score = c.label, float(c.score)
+            except Exception:
+                pass
         else:
             img = mp.Image(image_format=mp.ImageFormat.SRGB,
                            data=np.ascontiguousarray(rgb))
             ts = int((time.time() - self._t0) * 1000)
             res = self._hands.detect_for_video(img, ts)
             if not res.hand_landmarks:
-                return None
+                return None, None, 0.0
             lms = res.hand_landmarks[0]
-        return np.array([[p.x, p.y, p.z] for p in lms], dtype=np.float32)
+            side, score = None, 0.0
+            try:
+                c = res.handedness[0][0]
+                side, score = c.category_name, float(c.score)
+            except Exception:
+                pass
+        return np.array([[p.x, p.y, p.z] for p in lms], dtype=np.float32), side, score
 
     def close(self):
         try:
@@ -200,13 +224,16 @@ class Overlay:
 
 def parse_args():
     p = argparse.ArgumentParser(description="近景手势数据采集（21 点特征向量）")
-    p.add_argument("--preset", choices=["single", "combo", "all"], default=None,
+    p.add_argument("--preset", choices=list(PRESETS), default=None,
                    help="内置类表：single=单指 4 类, combo=组合 10 类, all=14 类")
     p.add_argument("--labels", default="ok,peace,fist,point",
                    help="逗号分隔的类别名（--preset 优先）；最多 14 个")
     p.add_argument("--out", default=os.path.join(HERE, "data", "gesture_data.csv"),
                    help="输出 CSV 路径")
     p.add_argument("--target", type=int, default=300, help="每类目标样本数")
+    p.add_argument("--add", type=int, default=0,
+                   help="在现有条数基础上每类再加 N 条；换朝向采第二批时用这个，"
+                        "比把 --target 调大更清楚，也不会把已经采够的类带上")
     p.add_argument("--interval", type=float, default=0.12, help="自动采集最小间隔（秒）")
     p.add_argument("--min-move", type=float, default=0.05, help="特征变化小于此值则丢弃（去冗余）")
     p.add_argument("--cam", type=int, default=0, help="摄像头编号")
@@ -216,6 +243,11 @@ def parse_args():
     p.add_argument("--use-z", action="store_true", help="把 z 也存进特征（63 维；z 噪声大，一般不开）")
     p.add_argument("--min-hand-px", type=float, default=80.0,
                    help="掌长（腕→中指根）低于这个像素数就跳过，防尺度爆炸")
+    p.add_argument("--side", choices=["left", "right"], default="left",
+                   help="这一轮用哪只手采；right 会把 x 取反，让特征和左手同分布")
+    p.add_argument("--facing", choices=["palm", "back", "any"], default="any",
+                   help="这一轮手是掌心还是手背朝镜头（只记录，不参与特征计算）；"
+                        "朝向和类别相关会造成捷径学习，采完要按它查平衡")
     p.add_argument("--no-flip", action="store_true", help="不镜像画面")
     return p.parse_args()
 
@@ -261,6 +293,17 @@ def main():
     if rows:
         print(f"续采：{args.out} 已有 {len(rows)} 条")
 
+    # --add 用：记下启动时的条数当基准，运行中不跟着涨
+    base_counts = dict(counts)
+
+    def target_of(name):
+        return base_counts.get(name, 0) + args.add if args.add else args.target
+
+    if all(counts.get(n, 0) >= target_of(n) for n in labels):
+        print("所有类别都已达到目标条数，采不进去了。")
+        print("  · 换朝向采第二批：加 --add 150（在现有基础上每类再加 150）")
+        print("  · 或者把 --target 调大（注意它是每类总数，不是本次增量）")
+
     # 追加式审计日志：每写入/撤销/拒绝都记一行，事后能复盘参数与来源
     trace_path = os.path.splitext(os.path.abspath(args.out))[0] + "_trace.csv"
     trace_is_new = (not os.path.exists(trace_path)) or os.path.getsize(trace_path) == 0
@@ -280,6 +323,9 @@ def main():
             "out": os.path.abspath(args.out),
             "align": bool(args.align), "use_z": bool(args.use_z),
             "flip": not args.no_flip, "labels": labels, "dim": len(names),
+            # 这一轮用哪只手采的；right 表示特征已做过镜像归一化
+            "side": args.side, "mirror": bool(args.side == "right"),
+            "facing": args.facing,
             # 采集参数也要记，不然事后没法复核“这条为什么没被过滤”
             "interval": args.interval, "min_move": args.min_move,
             "target": args.target, "cam": args.cam,
@@ -325,14 +371,15 @@ def main():
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb.flags.writeable = False
-            pts = tracker.detect(rgb)
+            pts, side, side_score = tracker.detect_with_side(rgb)
             feat = None
             px = 0.0
             if pts is not None:
                 draw_hand(frame, pts, w, h)
                 px = hand_length(pts, w, h)
                 feat = extract(pts, width=w, height=h, align=args.align,
-                               use_z=args.use_z, min_hand_px=args.min_hand_px)
+                               use_z=args.use_z, min_hand_px=args.min_hand_px,
+                               mirror=(args.side == "right"))
 
             now = time.time()
             dt = now - t_prev
@@ -342,7 +389,7 @@ def main():
 
             label = state["label"]
             if feat is not None and label is not None and state["auto"]:
-                if now - state["last_t"] >= args.interval and counts.get(label, 0) < args.target:
+                if now - state["last_t"] >= args.interval and counts.get(label, 0) < target_of(label):
                     gap = (float("inf") if state["last_vec"] is None
                            else float(np.linalg.norm(feat - state["last_vec"])))
                     if gap >= args.min_move:
@@ -351,18 +398,19 @@ def main():
                         state["last_vec"] = feat
                         state["last_t"] = now
                         dirty = True
-                        trace_log("auto", label, gap, f"px={px:.0f}")
+                        trace_log("auto", label, gap,
+                                  f"px={px:.0f} {side or '?'}:{side_score:.2f} {args.facing}")
 
             # ---- HUD ----
             active = counts.get(label, 0) if label else 0
             if label is None:
                 head = ("未选类别    ", "no class   ", (200, 200, 200))
             elif state["auto"]:
-                head = (f"{label}  {active}/{args.target}  录制中 ●",
-                        f"{label}  {active}/{args.target}  REC ●", (60, 220, 60))
+                head = (f"{label}  {active}/{target_of(label)}  录制中 ●",
+                        f"{label}  {active}/{target_of(label)}  REC ●", (60, 220, 60))
             else:
-                head = (f"{label}  {active}/{args.target}  已暂停 ‖",
-                        f"{label}  {active}/{args.target}  PAUSE ‖", (60, 200, 255))
+                head = (f"{label}  {active}/{target_of(label)}  已暂停 ‖",
+                        f"{label}  {active}/{target_of(label)}  PAUSE ‖", (60, 200, 255))
 
             cls_lines, chunk = [], []
             for i, n in enumerate(labels):
@@ -377,9 +425,11 @@ def main():
                         f"too small {px:.0f}px", (60, 120, 255))
             else:
                 info = (f"手:{1 if feat is not None else 0}  FPS:{state['fps']:.0f}"
-                        f"  掌长:{px:.0f}px  维度:{len(names)}",
+                        f"  掌长:{px:.0f}px  维度:{len(names)}"
+                        f"  采:{args.side}{'→镜像' if args.side == 'right' else ''}"
+                        f"  检测:{side or '?'}{f'/{side_score:.2f}' if side else ''}",
                         f"hand:{1 if feat is not None else 0}  fps:{state['fps']:.0f}"
-                        f"  palm:{px:.0f}px  dim:{len(names)}",
+                        f"  palm:{px:.0f}px  dim:{len(names)}  side:{args.side}",
                         (230, 230, 230))
             hud.put(frame, [head] + [(c, c, (200, 220, 255)) for c in cls_lines]
                     + [info, (HINT[0], HINT[1], (210, 210, 210))])
@@ -457,7 +507,7 @@ def main():
     if other:
         print(f"  其他标签            {other:>5} 条")
     print(f"总计 {len(rows)} 条 -> {os.path.abspath(args.out)}")
-    short = [n for n in labels if counts.get(n, 0) < args.target]
+    short = [n for n in labels if counts.get(n, 0) < target_of(n)]
     if short:
         print(f"还差：{', '.join(short)}（再跑一次会自动续采）")
 

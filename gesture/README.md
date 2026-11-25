@@ -43,10 +43,17 @@ python -m venv .venv
 ## 3. 采集
 
 ```powershell
-.\.venv\Scripts\python collect.py --preset single --target 250   # 单指 4 类
-.\.venv\Scripts\python collect.py --preset combo  --target 250   # 组合 10 类
-.\.venv\Scripts\python collect.py --preset all    --target 250   # 14 类
+# 单指 4 类
+.\.venv\Scripts\python collect.py --preset single --facing palm --target 250
+
+# 组合 9 类 + 其他 1 类，手心手背分两轮采
+.\.venv\Scripts\python collect.py --preset combo --facing palm  --target 150
+.\.venv\Scripts\python collect.py --preset combo --facing back  --add 150
+.\.venv\Scripts\python collect.py --preset other --facing palm  --target 150
 ```
+
+`--target` 是**每类总数**，改朝向采第二批时要加 `--add N`（在现有条数上每类再加 N 条），
+否则程序会认为所有类都采满了、一帧都不记。
 
 窗口里用键盘：
 
@@ -63,7 +70,7 @@ python -m venv .venv
 
 ### 类表（`--preset`）
 
-| 键 | 单指类 | 键 | 组合类 |
+| 键 | 单指类 | 键 | 组合类 / 其他 |
 |---|---|---|---|
 | `0` | 食指 | `4` | 点赞 |
 | `1` | 中指 | `5` | OK |
@@ -72,18 +79,26 @@ python -m venv .venv
 | | | `8` | 握拳 |
 | | | `9` | 六（call） |
 | | | `a` | 点踩（反向点赞） |
-| | | `d` | 后三指（中·无名·小） |
 | | | `f` | 中三指（食·中·无名） |
 | | | `g` | 比心（单手） |
+| | | `h` | 其他 |
 
-`--preset all` 的顺序是 4 个单指在前、10 个组合在后，所以 `0`–`3` 单指、`4`–`9`+`a`/`d`/`f`/`g` 组合。
+**「其他」是分类器的出口**：不属于任何目标手势的姿势都丢这里。没有这一类，
+模型对任何输入都必须硬选一个目标类（比个大拇指会被判成中指）。
+采的时候别只采一种姿势，要覆盖"接近真类但不对"的变体。
+
+> 原「后三指」已删除：它与 OK 的类间中心距只有 0.93（全场最近），手背朝镜头时
+> 拇指食指的"环"被遮住，两类根本分不开。删掉后 OK 的召回从 83% 升到 100%。
 
 ## 4. 参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--labels` | ok,peace,fist,point | 逗号分隔，最多 10 类 |
-| `--target` | 300 | 每类目标条数，够了自动停 |
+| `--labels` | 无 | 逗号分隔的类别名，`--preset` 优先；最多 10 个 |
+| `--target` | 300 | 每类目标**总**条数，够了自动停 |
+| `--add` | 0 | 在现有条数上每类**再加** N 条（换朝向采第二批用这个） |
+| `--side` | left | 本轮用哪只手；`right` 会把 x 取反，让特征和训练集同分布 |
+| `--facing` | any | 本轮手心/手背朝镜头，只记录不参与特征；查朝向平衡用 |
 | `--interval` | 0.12 | 自动采集间隔（秒） |
 | `--min-move` | 0.05 | 特征差小于它就算重复，丢弃 |
 | `--min-hand-px` | 80 | 掌长低于这个像素数就跳过（防尺度爆炸） |
@@ -127,6 +142,19 @@ gesture/
 2. 减去手掌五点 (0,5,9,13,17) 质心 → 画面位置无关
 3. `--align` 时旋转到中指朝上 → 倾斜无关
 4. `--min-hand-px 80`：掌长不足 80px 的点直接跳过（手太远/检测飘，会把特征尺度炸开）
+5. `mirror=True`：把 x 取反，右手 → 镜像成左手的样子
+
+**镜像归一化**：训练集只有一只手时，另一只手做同样的动作在画面里是镜像关系。
+采集时用 `--side right`（或 `--side left`）声明本轮用哪只手，右侧会存成镜像后的特征；
+模型包里记 `train_side`，推理端发现是另一只手就自动镜像。
+
+**左右手门控**：`decide_mirror(side, score, train_side, min_score=0.80)`。
+分数低于 0.80 时**不镜像、但也照常分类**——模型做过镜像增广，对"翻不翻"不敏感，
+没必要为了判不清左右手而丢掉这一帧。
+
+> **朝向陷阱**：采集时如果每类的"手心/手背"比例差别很大，模型会把"拇指在哪一侧"
+> 当成类别线索。`check_data.py` 的「朝向平衡」段就是查这个：单侧 >70% 会标 ⚠。
+> 训练时加 `--mirror-aug` 可以把每类的两侧自动拉平，代价是 kNN 略降。
 
 **v1 数据已归档**（`_archive\`），现在的 `gesture_data.csv` 就是 v2。
 两个空间只差 `D=diag(w,h)`，`feat_px = D·feat / ‖D·(feat9−feat0)‖`，尺度因子约掉。
@@ -136,11 +164,20 @@ gesture/
 
 ```powershell
 .\.venv\Scripts\python check_data.py          # 先体检
-.\.venv\Scripts\python train.py               # 直接用这个（旋转归一是默认）
+.\.venv\Scripts\python train.py --mirror-aug  # 数据里有单朝向的类时必须加
 ```
 
+当前数据集（14 类 / 5091 条，时间切分 60/10/30）：
+
+| 指标 | 值 |
+|---|---|
+| 总体 | 88.5% |
+| 不含「其他」 | **96.9%** |
+| 标签打乱对照 | 15.0%（14 类随机 7.1%） |
+
 - `--align` **已经是默认行为**，不用加；要关才写 `--no-align`（只用于对照实验）。
-  忘加参数会让准确率从 94.7% 掉到 86%，而且模型包里 `align=False` 会让推理端老实照做
+  忘加参数会让准确率掉一大截，而且模型包里 `align=False` 会让推理端老实照做
+- `--mirror-aug`：训练集做镜像增广（x 取反），测试集不动。**测试集翻转等于换答案**
 - `--k 1` 不抽稀。42 维特征配 100 来个样本学不动，**现在冗余不是问题，样本不够才是**
 - `--clip 3.0` 丢掉 |x|>3 的尺度爆炸样本
 - `--trim 0.1` 每类首尾各丢 10%，去掉换手势时的过渡帧（默认 0）
@@ -153,17 +190,19 @@ gesture/
 ```python
 {
   "model": <已 fit 的 StandardScaler + SVC pipeline>,
-  "classes": [...],
+  "classes": [...],         # 14 类，顺序即 predict_proba 的下标
   "align": True,            # 推理时 extract(..., align=True)
   "min_hand_px": 80.0,      # 推理时的掌长门控
+  "train_side": "left",     # 训练集是哪只手，另一只手推理时镜像
+  "mirror_aug": True,       # 训练时是否做了镜像增广
   "feature_version": 2,
   "dim": 42, "use_z": False,
-  "test_acc": 0.9467, "n_train": 600, "trained_at": "...", "sklearn": "1.9.1"
+  "test_acc": 0.8847, "n_train": 3055, "trained_at": "...", "sklearn": "1.9.1"
 }
 ```
 
 `SVC(probability=True)` 才会算 `predict_proba`（Platt 标定，内部 5 折，训练慢几倍但样本小无所谓）。
-代价：`predict_proba` 的 argmax 和 `predict()` 可能有一两例不一致，94.7% → 回放 94.3% 就是这个原因，正常。
+代价：`predict_proba` 的 argmax 和 `predict()` 可能有一两例不一致，属正常现象。
 
 ## 8. 推理
 

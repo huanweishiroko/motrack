@@ -1,4 +1,5 @@
 {
+  "out": "E:\\motrack\\gesture\\data\\gesture_data.csv",
   "align": false,
   "use_z": false,
   "flip": true,
@@ -9,14 +10,17 @@
     "小指"
   ],
   "dim": 42,
+  "side": "left",
+  "mirror": false,
+  "facing": "back",
   "interval": 0.12,
   "min_move": 0.05,
-  "target": 250,
+  "target": 300,
   "cam": 0,
   "min_hand_px": 80.0,
   "frame_width": 960,
   "frame_height": 540,
   "feature_version": 2,
-  "resume_rows": 0,
-  "created_at": "2026-11-23T15:06:13"
+  "resume_rows": 4791,
+  "created_at": "2026-11-25T17:25:56"
 }

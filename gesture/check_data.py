@@ -142,6 +142,16 @@ for fold in range(5):
 
 acc = correct / len(X)
 say("")
+say("")
+say("朝向平衡：拇指尖 x − 小指尖 x 的正负（同一类两侧差太多会诱发捷径学习）")
+side_val = X[:, 2 * 4] - X[:, 2 * 20]
+for c in classes:
+    sc = side_val[y == c]
+    pos, neg = int((sc > 0).sum()), int((sc < 0).sum())
+    share = pos / max(1, len(sc))
+    flag = "  ⚠ 偏斜" if (max(share, 1 - share) > 0.70 and len(sc) >= 20) else ""
+    say(f"  {c:<8} 正 {pos:>3} / 负 {neg:>3}   正占比 {share:.0%}{flag}")
+
 say(f"5 折 kNN(k={k}) 准确率: {acc:.1%}   ← 数据本身可分性，不是最终模型指标")
 if conf:
     say("最容易混的类别对:")

@@ -46,6 +46,23 @@ def to_pixels(points, width: float, height: float) -> np.ndarray:
     return pts
 
 
+def decide_mirror(side, score, train_side="left", min_score=0.80):
+    """根据 handedness 决定要不要镜像。
+
+    返回 (mirror, confident)：
+      mirror=True      这只手和训练集不是同一只，需要翻转 x
+      confident=False  左右手判不准（双手交叉 / 遮挡 / 侧对镜头），
+                       调用方应当跳过判定，而不是猜一个方向
+
+    train_side 是训练集用的那只手（MediaPipe 报出来的名字）。
+    注意 MediaPipe 的 handedness 假设输入是镜像自拍画面，
+    所以这里只比「同不同」，不假设 Left 一定对应你的左手。
+    """
+    if not side or score < min_score:
+        return False, False
+    return str(side).strip().lower() != str(train_side).strip().lower(), True
+
+
 def hand_length(points, width: float | None = None, height: float | None = None) -> float:
     """掌长 = ‖中指根 − 手腕‖。给了 width/height 就是像素长度。"""
     pts = np.asarray(points, dtype=np.float32)
@@ -54,16 +71,22 @@ def hand_length(points, width: float | None = None, height: float | None = None)
     return float(np.linalg.norm(pts[MIDDLE_MCP] - pts[WRIST]))
 
 
-def extract(points, width=None, height=None, align=False, use_z=False, min_hand_px=0.0):
+def extract(points, width=None, height=None, align=False, use_z=False,
+            min_hand_px=0.0, mirror=False):
     """(21,3) -> 1D float32 特征向量。
 
     归一化流程：
       0. 给了 width/height 就先乘回像素坐标（各向同性）
+      0b. mirror=True 时把 x 取反（右手 → 镜像成左手的样子）
       1. min_hand_px 门控：掌长太短说明手太远/检测飘，返回 None
       2. 除以掌长            => 与远近无关
       3. 减去手掌五点质心    => 与画面位置无关
       4. align=True 时旋转到中指朝上 => 与手的倾斜无关
     退化帧返回 None。
+
+    mirror 用在哪：训练集只有一只手时，另一只手做同样的动作，
+    21 点在画面里是镜像关系；把 x 取反后就能和训练集同分布。
+    要不要镜像由 handedness 决定，见 decide_mirror()。
     """
     pts = np.asarray(points, dtype=np.float32).copy()
     if pts.shape != (21, 3):
@@ -71,6 +94,9 @@ def extract(points, width=None, height=None, align=False, use_z=False, min_hand_
 
     if width is not None and height is not None:
         pts = to_pixels(pts, width, height)
+
+    if mirror:
+        pts[:, 0] = -pts[:, 0]
 
     scale = float(np.linalg.norm(pts[MIDDLE_MCP] - pts[WRIST]))
     if not np.isfinite(scale) or scale < 1e-6:
@@ -152,6 +178,19 @@ def _self_test() -> None:
           round(float(np.linalg.norm(extract(pts, 640, 480, align=True)
                                      - extract(spun, 640, 480, align=True))), 6))
 
+    # 7) 镜像：右手做同样的动作 = 左手镜像，翻回来应与左手特征一致
+    right = pts.copy()
+    right[:, 0] = -right[:, 0]
+    m_left = extract(pts, 640, 480, align=True)
+    m_right = extract(right, 640, 480, align=True, mirror=True)
+    print("镜像还原后与左手 L2 差 :", round(float(np.linalg.norm(m_left - m_right)), 6))
+
+    # 8) handedness 门控
+    mir, ok = decide_mirror("Right", 0.95)
+    print(f"decide_mirror('Right', 0.95) -> mirror={mir}, confident={ok}")
+    mir2, ok2 = decide_mirror("Right", 0.55)
+    print(f"decide_mirror('Right', 0.55) -> mirror={mir2}, confident={ok2}")
+
     # 6) min_hand_px 门控
     small = hand_length(pts, 640, 480)
     print(f"掌长 {small:.0f}px, min_hand_px={small + 10:.0f} 时应为 None:",
@@ -163,6 +202,10 @@ def _self_test() -> None:
     assert np.allclose(conv, wide, atol=1e-5)
     assert np.linalg.norm(wide - moved) < 1e-4
     assert extract(pts, 640, 480, min_hand_px=small + 10) is None
+    assert np.linalg.norm(m_left - m_right) < 1e-5
+    assert decide_mirror("Right", 0.95) == (True, True)
+    assert decide_mirror("left", 0.95) == (False, True)
+    assert decide_mirror("Right", 0.55) == (False, False)
     assert extract(np.zeros((21, 3), np.float32)) is None
     assert extract(pts, use_z=True).size == 63
     print("自检通过 [OK]")
