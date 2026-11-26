@@ -9,7 +9,11 @@ import urllib.request
 import joblib
 from fastapi.middleware.cors import CORSMiddleware
 import sys
+import logging
 from collections import deque, Counter
+
+if os.environ.get("MOTRACK_ACCESS_LOG") != "1":
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "gesture"))
 
@@ -23,6 +27,9 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    # 浏览器对 application/json 的 POST 会先发 OPTIONS 预检；不设这个就默认 5 秒一次，
+    # 5 FPS 下等于每帧多一个请求。设成 1 天，预检只剩每天一次。
+    max_age=86400,
 )
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -74,9 +81,13 @@ class Gestureoutput(BaseModel):
 def decode_base64_image(img_str):
     if "," in img_str:
         img_str=img_str.split(",")[1]
-    img_bytes=base64.b64decode(img_str)
-    numpy_arr=numpy.frombuffer(img_bytes,numpy.uint8)
-    frame=cv2.imdecode(numpy_arr,cv2.IMREAD_COLOR_RGB)
+    try:
+        img_bytes=base64.b64decode(img_str)
+        numpy_arr=numpy.frombuffer(img_bytes,numpy.uint8)
+        frame=cv2.imdecode(numpy_arr,cv2.IMREAD_COLOR_RGB)
+    except Exception:
+        # 空串 / 半截数据 / 非图片：cv2 会直接抛 cv2.error，不该让整个请求 500
+        return None
     return frame
 
 def ensure_model(path: str) -> str:
@@ -236,3 +247,9 @@ def detect_gesture(data:Gestureinput):
                          feedback=feedback,
                          state="low_confidence" if bad else "ready",
                          keypoints=keypoints)
+
+
+# WebSocket 版本：逻辑全在 ws_gesture.py，这里只挂上去。
+# 想退回纯 HTTP，把下面两行注释掉即可（HTTP 接口完全不受影响）。
+from ws_gesture import router as _ws_router
+app.include_router(_ws_router)
