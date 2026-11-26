@@ -35,8 +35,46 @@
 - [x] 训练集镜像增广，抵消「朝向↔类别」相关性
 - [x] 扩展到 14 类（4 单指 + 9 组合 + 其他），数据 5091 条
 - [x] 四不像兜进「其他」，不再强行判真手势
-- [ ] WebSocket 视频流实时帧传输
+- [x] WebSocket 长连接（二进制帧 + 每连接投票状态 + 背压丢旧帧），HTTP 接口保留
+- [x] 每连接 VIDEO 模式检测器（单帧 28ms，共享 IMAGE 约 45–56ms）
+- [x] 运行指标接口 `/api/stats`（p50/p95、FPS、丢帧），前端实时显示
 - [ ] 业务闭环（会话管理、判定记录、历史趋势）
+
+## 接口
+
+两条通道，返回结构一致（WS 版多 `type` 和 `ts` 两个字段），前端用 `USE_WS` 开关切换。
+
+| 通道 | 地址 | 上行 | 说明 |
+|---|---|---|---|
+| HTTP | `POST /api/Gestureinput` | `{"img_64": "data:image/jpeg;base64,..."}` | 单帧、无状态，保留作回退路径 |
+| WebSocket | `WS /ws/gesture` | **二进制帧**（JPEG 字节，不套 JSON） | 长连接，每连接一份投票历史 |
+| 指标 | `GET /api/stats` | — | 连接数、帧数、丢帧、p50/p95 延迟、FPS |
+
+`/api/stats` 返回示例：
+
+```json
+{"connections":0,"connections_peak":1,"frames_in":20,"frames_served":20,
+ "frames_dropped":0,"errors":0,
+ "latency_ms":{"p50":18.0,"p95":44.0,"max":44.0},
+ "fps":10.0,"uptime_s":20.5}
+```
+
+`latency_ms` 是**服务端处理耗时**（解码 + 检测 + 分类），不含网络往返。
+
+WS 的三条约定：
+
+- **一帧一应答**：客户端收到结果才发下一帧，天然背压
+- **服务端丢旧帧**：处理慢时缓冲区只留最新一张，不排队堆积
+- **坏数据回错误帧**：`{"type":"error","code":"decode_failed"}`，不断连接
+
+每条连接持有自己的 **VIDEO 模式检测器**（跨帧追踪），单帧约 **28ms**；
+HTTP 走共享的 IMAGE 检测器，同图约 45–56ms。检测器上限 4 个，超出或创建失败时
+自动退回共享检测器，连接不受影响。
+
+心跳：客户端发文本帧 `ping`，服务端回 `{"type":"pong"}`。
+
+> WS 逻辑全在 `backend/ws_gesture.py`，`main.py` 只多两行 `include_router`。
+> 想退回纯 HTTP，注释掉那两行即可。
 
 ## 手势判定
 
@@ -102,7 +140,8 @@ motrack/
 ├── app/
 │   └── index.html              # 前端页面（原生 HTML/JS，摄像头抽帧 + 骨架绘制）
 ├── backend/
-│   └── main.py                 # FastAPI 后端主程序
+│   ├── main.py                 # FastAPI 后端主程序（HTTP 接口）
+│   └── ws_gesture.py           # WebSocket 接口（每连接独立投票状态）
 ├── gesture/                    # 21 点特征：采集 → 训练 → 推理
 │   ├── collect.py              # 摄像头采集，出 CSV（--side / --facing / --add）
 │   ├── gesture_features.py     # 21 点 → 42 维特征（v2）
