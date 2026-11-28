@@ -1,27 +1,31 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-import mediapipe
 import base64
-import numpy
-import cv2
-import os
-import urllib.request
-import joblib
-from fastapi.middleware.cors import CORSMiddleware
-import sys
 import logging
-from collections import deque, Counter
+import os
+import sys
+import urllib.request
+from collections import Counter, deque
 
+import cv2
+import joblib
+import mediapipe
+import numpy
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from pydantic import BaseModel
+
+# uvicorn 的访问日志每帧两行（OPTIONS + POST），5 FPS 下会把有用信息刷掉。
+# 需要排查请求时设 MOTRACK_ACCESS_LOG=1。
 if os.environ.get("MOTRACK_ACCESS_LOG") != "1":
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "gesture"))
 
 from gesture_features import extract
 
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-app=FastAPI(title="手势交互系统")
+app = FastAPI(title="手势交互系统")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -70,13 +74,13 @@ class Gestureinput(BaseModel):
     img_64:str
 
 class Gestureoutput(BaseModel):
-    status:str #success or error
-    is_success:bool 
-    gesture_name:str
-    confidence:float #置信度
-    feedback:str
-    state:str
-    keypoints: dict[str,list[float]]|None=None
+    status: str                 # success / error
+    is_success: bool
+    gesture_name: str
+    confidence: float           # 置信度
+    feedback: str
+    state: str
+    keypoints: dict[str, list[float]] | None = None
 
 def decode_base64_image(img_str):
     if "," in img_str:
@@ -93,7 +97,7 @@ def decode_base64_image(img_str):
 def ensure_model(path: str) -> str:
     if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
         return path
-    
+
     print(f"[model] 本地没有模型，下载中 → {path}")
     urllib.request.urlretrieve(MODEL_URL, path)
     print(f"[model] 完成 {os.path.getsize(path) / 1e6:.1f} MB")
@@ -114,7 +118,6 @@ def make_detector(model_path: str, num_hands: int, video_mode: bool):
     return vision.HandLandmarker.create_from_options(options)
 
 
-
 _detector = None
 
 def get_detector():
@@ -130,7 +133,7 @@ CLF_CLASSES = _B["classes"]
 CLF_ALIGN = _B["align"]
 MIN_HAND_PX = _B["min_hand_px"]
 TRAIN_SIDE = _B.get("train_side", "left")   # 训练集是哪只手；另一只手推理时镜像
-MIN_SIDE_CONF = 0.80                        # 左右手判定低于此值 → 不翻、不判
+MIN_SIDE_CONF = 0.80                        # 左右手判定低于此值 → 不镜像（翻错也无所谓）
 OTHER_LABEL = "其他"                         # 四不像统一兜到这一类，不强行判真手势
 print(f"[clf] {len(CLF_CLASSES)} 类 {CLF_CLASSES}, align={CLF_ALIGN}, "
       f"min_hand_px={MIN_HAND_PX:g}, train_side={TRAIN_SIDE}, test_acc={_B['test_acc']}")
@@ -151,7 +154,7 @@ def classify_hand(landmarks, width, height, mirror=False):
     order = numpy.argsort(proba)[::-1]
     top1, top2 = float(proba[order[0]]), float(proba[order[1]])
     if top1 < CONF_MIN or (top1 - top2) < MARGIN_MIN:
-        return (OTHER_LABEL, top1)   # 四不像：兜进「其他」，不强行选真手势 
+        return (OTHER_LABEL, top1)   # 四不像：兜进「其他」，不强行选真手势
     return CLF_CLASSES[order[0]], top1
 
 
@@ -184,14 +187,14 @@ def detect_gesture(data:Gestureinput):
             gesture_name="",
             confidence=0.0,
             feedback="无法解码图像",
-            state="no_person", #no_person仅占位
+            state="no_person",
             keypoints=None
         )
     height, width = frame.shape[:2]
     result=get_detector().detect(to_mp_image(frame))
     hands=result.hand_landmarks
     labels=result.handedness
-    
+
     if not hands:
         return Gestureoutput(
             status="success",
@@ -214,13 +217,14 @@ def detect_gesture(data:Gestureinput):
         for idx, name in enumerate(HAND_KEYS):
             lm = landmarks[idx]
             keypoints[f"{side}_{name}"] = [lm.x, lm.y, lm.z]
-        # 左右手判不准就不翻：模型对镜像不敏感，翻错方向也无所谓，别丢帧
+        # 左右手判不准就不镜像：模型做过镜像增广，翻错方向也无所谓，别为此丢帧
         counts.append(_vote(side, classify_hand(
             landmarks, width, height,
             side != TRAIN_SIDE if score >= MIN_SIDE_CONF else False)))
     avg = sum(scores) / len(scores) if scores else 0.0
     low = avg < LOW_CONF
-    side_cn = "双手" if len(hands) > 1 else ("左手" if getattr(labels[0][0], "category_name", "") == "Left" else "右手")
+    side_cn = ("双手" if len(hands) > 1 else
+               ("左手" if getattr(labels[0][0], "category_name", "") == "Left" else "右手"))
     picked = [c for c in counts if c is not None]
     gated = len(picked) < len(counts)
     unknown = any(c[0] in ("?", OTHER_LABEL) for c in picked)
